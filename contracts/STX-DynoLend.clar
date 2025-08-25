@@ -3,151 +3,199 @@
 ;; <add a description here>
 
 
+;; Constants
+(define-constant CONTRACT_OWNER tx-sender)
+(define-constant ERR_NOT_AUTHORIZED (err u100))
+(define-constant ERR_NFT_NOT_FOUND (err u101))
+(define-constant ERR_ALREADY_LISTED (err u102))
+(define-constant ERR_NOT_LISTED (err u103))
+(define-constant ERR_INSUFFICIENT_VALUE (err u104))
+(define-constant ERR_LOAN_NOT_FOUND (err u105))
+(define-constant ERR_LOAN_DEFAULTED (err u106))
+(define-constant ERR_LOAN_NOT_DUE (err u107))
+(define-constant ERR_LOAN_CLOSED (err u108))
 
-# STX-DynoLend - Dynamic NFT-Backed Loan Smart Contract
+;; NFT Definition
+(define-non-fungible-token dynamic-nft uint)
 
-## Overview
+;; Data Maps
+(define-map token-attributes
+    { token-id: uint }
+    {
+        rarity: uint,
+        power-level: uint,
+        condition: uint,
+        last-updated: uint
+    }
+)
 
-This Clarity smart contract implements a **dynamic NFT-backed lending system** on the Stacks blockchain. It allows users to mint NFTs whose attributes evolve based on **loan repayment behavior**, enabling a DeFi lending mechanism where NFTs serve as **collateral**.
+(define-map loan-details
+    { loan-id: uint }
+    {
+        borrower: principal,
+        lender: principal,
+        token-id: uint,
+        amount: uint,
+        interest-rate: uint,
+        duration: uint,
+        start-block: uint,
+        status: (string-utf8 20),
+        missed-payments: uint,
+        total-repaid: uint
+    }
+)
 
-Borrowers can list NFTs for loans, and lenders can fund these loans with STX. If the borrower repays on time, the NFT retains or improves its attributes. If the borrower defaults or misses payments, the NFT's attributes degrade.
+(define-map token-loans 
+    { token-id: uint }
+    { loan-id: uint }
+)
 
----
+(define-map loan-listings
+    { token-id: uint }
+    {
+        owner: principal,
+        requested-amount: uint,
+        min-duration: uint,
+        max-interest: uint
+    }
+)
 
-## 🧠 Key Features
+;; Variables
+(define-data-var next-token-id uint u1)
+(define-data-var next-loan-id uint u1)
 
-* **Minting Dynamic NFTs**
-  Each NFT has mutable attributes: `rarity`, `power-level`, `condition`, and `last-updated`.
+;; Read-only functions
+(define-read-only (get-token-attributes (token-id uint))
+    (map-get? token-attributes { token-id: token-id })
+)
 
-* **Loan Listing Mechanism**
-  NFT owners can list tokens with loan terms (amount, duration, interest cap).
+(define-read-only (get-loan-details (loan-id uint))
+    (map-get? loan-details { loan-id: loan-id })
+)
 
-* **Lending System**
-  Lenders offer loans that match listing conditions. Funds are transferred to borrowers, and NFTs are held in escrow.
+(define-read-only (get-token-loan (token-id uint))
+    (map-get? token-loans { token-id: token-id })
+)
 
-* **Loan Terms and Tracking**
-  Loans include amount, duration, interest, repayment history, and status.
+(define-read-only (get-loan-listing (token-id uint))
+    (map-get? loan-listings { token-id: token-id })
+)
 
-* **Dynamic NFT Evolution**
-  NFT attributes can be updated based on repayment status (future functionality could include scheduled updates).
+;; Mint new NFT
+(define-public (mint-nft (recipient principal))
+    (let 
+        ((token-id (var-get next-token-id)))
 
----
+        ;; Mint NFT
+        (try! (nft-mint? dynamic-nft token-id recipient))
 
-## 📚 Data Structures
+        ;; Set initial attributes
+        (map-set token-attributes
+            { token-id: token-id }
+            {
+                rarity: u100,
+                power-level: u100,
+                condition: u100,
+                last-updated: block-height
+            }
+        )
 
-### ✅ Constants
+        ;; Increment token ID
+        (var-set next-token-id (+ token-id u1))
+        (ok token-id)
+    )
+)
 
-* `CONTRACT_OWNER`: The deployer of the contract
-* Various `ERR_` codes for error handling
+;; List NFT for loan
+(define-public (list-nft-for-loan 
+    (token-id uint) 
+    (requested-amount uint)
+    (min-duration uint)
+    (max-interest uint))
 
-### ✅ NFT Token
+    (let ((owner (unwrap! (nft-get-owner? dynamic-nft token-id) ERR_NFT_NOT_FOUND)))
+        ;; Checks
+        (asserts! (is-eq tx-sender owner) ERR_NOT_AUTHORIZED)
+        (asserts! (is-none (get-loan-listing token-id)) ERR_ALREADY_LISTED)
 
-* `dynamic-nft`: Non-fungible token with numeric IDs
+        ;; Create listing
+        (map-set loan-listings
+            { token-id: token-id }
+            {
+                owner: tx-sender,
+                requested-amount: requested-amount,
+                min-duration: min-duration,
+                max-interest: max-interest
+            }
+        )
+        (ok true)
+    )
+)
 
-### ✅ Maps
+;; Offer loan
+(define-public (offer-loan 
+    (token-id uint)
+    (amount uint)
+    (interest-rate uint)
+    (duration uint))
 
-* `token-attributes`: Tracks mutable NFT stats
-* `loan-details`: Full loan data indexed by `loan-id`
-* `token-loans`: Links NFTs to active loans
-* `loan-listings`: Open listings of NFTs available for loan
+    (let 
+        ((listing (unwrap! (get-loan-listing token-id) ERR_NOT_LISTED))
+         (loan-id (var-get next-loan-id)))
 
-### ✅ Variables
+        ;; Checks
+        (asserts! (>= amount (get requested-amount listing)) ERR_INSUFFICIENT_VALUE)
+        (asserts! (>= duration (get min-duration listing)) ERR_INSUFFICIENT_VALUE)
+        (asserts! (<= interest-rate (get max-interest listing)) ERR_INSUFFICIENT_VALUE)
 
-* `next-token-id`: Incremental ID for minting new NFTs
-* `next-loan-id`: Incremental ID for tracking loans
+        ;; Transfer STX to borrower
+        (try! (stx-transfer? amount tx-sender (get owner listing)))
 
----
+        ;; Create loan
+        (map-set loan-details
+            { loan-id: loan-id }
+            {
+                borrower: (get owner listing),
+                lender: tx-sender,
+                token-id: token-id,
+                amount: amount,
+                interest-rate: interest-rate,
+                duration: duration,
+                start-block: block-height,
+                status: u"active",
+                missed-payments: u0,
+                total-repaid: u0
+            }
+        )
 
-## ⚙️ Functions
+        ;; Link token to loan
+        (map-set token-loans { token-id: token-id } { loan-id: loan-id })
 
-### 🔍 Read-Only
+        ;; Remove listing
+        (map-delete loan-listings { token-id: token-id })
 
-* `get-token-attributes`: View NFT stats
-* `get-loan-details`: View loan information
-* `get-token-loan`: View current loan on an NFT
-* `get-loan-listing`: View open loan listing
+        ;; Transfer NFT to contract
+        (try! (nft-transfer? dynamic-nft token-id (get owner listing) (as-contract tx-sender)))
 
-### 🛠 Public
+        ;; Increment loan ID
+        (var-set next-loan-id (+ loan-id u1))
+        (ok loan-id)
+    )
+)
 
-* `mint-nft`: Mint a new dynamic NFT with default attributes
-* `list-nft-for-loan`: List an NFT for a loan with desired terms
-* `offer-loan`: Lend STX to a borrower in exchange for NFT collateral
+;; Internal function to calculate payment
+(define-private (calculate-payment (loan (tuple (amount uint) (interest-rate uint) (duration uint) (start-block uint))))
+    (let
+        ((total-amount (* (get amount loan) (+ u100 (get interest-rate loan))))
+         (payment-per-block (/ total-amount (get duration loan))))
+        payment-per-block
+    )
+)
 
-### 🧮 Private
+(define-private (min-uint (a uint) (b uint))
+    (if (<= a b) a b)
+)
 
-* `calculate-payment`: Calculates block-based payment obligations
-* `min-uint`, `max-uint`: Utility functions for comparisons
-
----
-
-## 💡 Future Enhancements
-
-* Repayment functionality
-* Penalty and default logic
-* NFT attribute mutation based on repayment
-* Liquidation mechanisms
-* Integration with frontends or NFT marketplaces
-
----
-
-## 🔐 Access Control
-
-* Only the NFT owner can list the token.
-* NFTs are transferred into escrow (contract custody) during active loans.
-* Loans can only be created if they meet listing requirements.
-
----
-
-## 💬 Error Codes
-
-| Code | Meaning             |
-| ---- | ------------------- |
-| 100  | Not authorized      |
-| 101  | NFT not found       |
-| 102  | Already listed      |
-| 103  | Not listed          |
-| 104  | Insufficient value  |
-| 105  | Loan not found      |
-| 106  | Loan defaulted      |
-| 107  | Loan not yet due    |
-| 108  | Loan already closed |
-
----
-
-## 📦 Deployment Notes
-
-* Written in Clarity for Stacks blockchain.
-* Ensure enough STX is available for loan transfers.
-* Future upgrades will require data migration or contract extension strategies.
-
----
-
-## 🧪 Testing Ideas
-
-* Mint NFTs and assert default attributes
-* List and re-list edge cases
-* Create valid and invalid loan offers
-* Confirm NFT transfer to contract
-* Simulate repayment and attribute change
-
----
-
-## 🔠 Name Suggestions
-
-1. **MorphoLoan**
-
-   * From "morph" and "loan", highlighting dynamic NFTs
-2. **ReputeFi**
-
-   * Reputational finance via NFTs
-3. **CollatX**
-
-   * Short for collateral exchange
-4. **MetaLoan**
-
-   * Emphasizing metadata evolution
-5. **DynoLend**
-
-   * A playful take on "dynamic" and "lend"
-
----
+(define-private (max-uint (a uint) (b uint))
+    (if (>= a b) a b)
+)
